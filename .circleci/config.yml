@@ -1,0 +1,22 @@
+version: 2.1
+
+jobs:
+  test:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install dev dependencies
+          command: pip install -r requirements-dev.txt
+      - run:
+          name: Unit tests
+          command: pytest -q
+      - run:
+          name: Lint CloudFormation template
+          command: cfn-lint template.yaml
+
+workflows:
+  ci:
+    jobs:
+      - test

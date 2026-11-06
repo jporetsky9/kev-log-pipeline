@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Daily ingest of the CISA KEV catalog into S3 with new-entry detection
+
+Parameters:
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 day)
+    Description: EventBridge schedule for the ingest
+  RetentionDays:
+    Type: Number
+    Default: 90
+    Description: Days to keep raw snapshots and new-entry files
+
+Resources:
+  FeedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-raw-snapshots
+            Status: Enabled
+            Prefix: raw/
+            ExpirationInDays: !Ref RetentionDays
+          - Id: expire-new-entries
+            Status: Enabled
+            Prefix: new/
+            ExpirationInDays: !Ref RetentionDays
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handler.lambda_handler
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref FeedBucket
+      Policies:
+        # Least privilege: this function's own bucket only. ListBucket is needed
+        # so a missing state file returns NoSuchKey instead of AccessDenied.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub "${FeedBucket.Arn}/*"
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt FeedBucket.Arn
+      Events:
+        Daily:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+
+  IngestErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The KEV ingest function reported an error
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestFunction
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  BucketName:
+    Value: !Ref FeedBucket
+  FunctionName:
+    Value: !Ref IngestFunction
