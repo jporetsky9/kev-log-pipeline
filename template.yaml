@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Daily ingest of the CISA KEV catalog into S3 with new-entry detection
+Description: Daily ingest of the CISA KEV catalog into S3 with new-entry detection and alerts
 
 Parameters:
   ScheduleExpression:
@@ -11,8 +11,28 @@ Parameters:
     Type: Number
     Default: 90
     Description: Days to keep raw snapshots and new-entry files
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email for new-entry alerts and error alarms (optional; confirm the SNS email)
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
 
 Resources:
+  # Not encrypted with the AWS-managed SNS key: CloudWatch alarms can't publish to a
+  # topic that uses it. Alerts carry only public CVE data.
+  AlertTopic:
+    Type: AWS::SNS::Topic
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
   FeedBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -42,14 +62,15 @@ Resources:
       CodeUri: src/
       Handler: handler.lambda_handler
       Runtime: python3.12
-      Timeout: 60
+      Timeout: 120  # room for 3 download attempts (15s each) plus backoff
       MemorySize: 256
       Environment:
         Variables:
           BUCKET_NAME: !Ref FeedBucket
+          TOPIC_ARN: !Ref AlertTopic
       Policies:
-        # Least privilege: this function's own bucket only. ListBucket is needed
-        # so a missing state file returns NoSuchKey instead of AccessDenied.
+        # Least privilege: this function's own bucket and topic only. ListBucket is
+        # needed so a missing state file returns NoSuchKey instead of AccessDenied.
         - Statement:
             - Effect: Allow
               Action:
@@ -59,6 +80,9 @@ Resources:
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !GetAtt FeedBucket.Arn
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref AlertTopic
       Events:
         Daily:
           Type: Schedule
@@ -80,9 +104,13 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
 
 Outputs:
   BucketName:
     Value: !Ref FeedBucket
   FunctionName:
     Value: !Ref IngestFunction
+  AlertTopicArn:
+    Value: !Ref AlertTopic

@@ -1,6 +1,7 @@
 import io
 import json
 import urllib.error
+from datetime import datetime, timezone
 
 import pytest
 
@@ -29,13 +30,21 @@ class FakeS3:
         return sorted(key for _, key in self.objects)
 
 
-def entry(cve, vendor="Acme", product="Widget"):
+class FakeSNS:
+    def __init__(self):
+        self.published = []
+
+    def publish(self, TopicArn, Subject, Message):
+        self.published.append({"TopicArn": TopicArn, "Subject": Subject, "Message": Message})
+
+
+def entry(cve, vendor="Acme", product="Widget", ransomware="Unknown"):
     return {
         "cveID": cve,
         "vendorProject": vendor,
         "product": product,
         "dueDate": "2026-12-01",
-        "knownRansomwareCampaignUse": "Unknown",
+        "knownRansomwareCampaignUse": ransomware,
     }
 
 
@@ -44,6 +53,15 @@ def s3(monkeypatch):
     fake = FakeS3()
     monkeypatch.setattr(handler, "get_s3", lambda: fake)
     monkeypatch.setenv("BUCKET_NAME", "test-bucket")
+    monkeypatch.delenv("TOPIC_ARN", raising=False)
+    return fake
+
+
+@pytest.fixture
+def sns(monkeypatch):
+    fake = FakeSNS()
+    monkeypatch.setattr(handler, "get_sns", lambda: fake)
+    monkeypatch.setenv("TOPIC_ARN", "arn:aws:sns:us-east-1:123456789012:kev-alerts")
     return fake
 
 
@@ -95,6 +113,69 @@ def test_empty_feed_aborts_without_touching_s3(s3, monkeypatch):
     with pytest.raises(ValueError):
         run_with_feed(monkeypatch, [])
     assert s3.keys() == []
+
+
+def test_large_drop_in_feed_size_aborts_before_writes(s3, monkeypatch):
+    run_with_feed(monkeypatch, [entry(f"CVE-2026-{i:04d}") for i in range(100)])
+    before = dict(s3.objects)
+
+    with pytest.raises(ValueError, match="partial download"):
+        run_with_feed(monkeypatch, [entry(f"CVE-2026-{i:04d}") for i in range(50)])
+    assert s3.objects == before  # state and snapshots untouched
+
+
+def test_two_runs_on_the_same_day_keep_both_new_entry_files(s3, monkeypatch):
+    times = iter([
+        datetime(2026, 11, 6, 9, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 11, 6, 9, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 11, 6, 15, 30, 0, tzinfo=timezone.utc),
+    ])
+
+    class FakeDatetime:
+        @staticmethod
+        def now(tz=None):
+            return next(times)
+
+    monkeypatch.setattr(handler, "datetime", FakeDatetime)
+    run_with_feed(monkeypatch, [entry("CVE-2026-0001")])
+    run_with_feed(monkeypatch, [entry("CVE-2026-0001"), entry("CVE-2026-0002")])
+    run_with_feed(monkeypatch, [entry("CVE-2026-0001"), entry("CVE-2026-0002"), entry("CVE-2026-0003")])
+
+    new_keys = [k for k in s3.keys() if k.startswith("new/")]
+    assert new_keys == [
+        "new/2026/11/06/new_entries_090000.jsonl",
+        "new/2026/11/06/new_entries_153000.jsonl",
+    ]
+
+
+def test_new_entries_publish_one_sns_alert(s3, sns, monkeypatch):
+    run_with_feed(monkeypatch, [entry("CVE-2026-0001")])
+    assert sns.published == []  # baseline run never alerts
+
+    run_with_feed(monkeypatch, [
+        entry("CVE-2026-0001"),
+        entry("CVE-2026-0002", "Globex", "Gateway", ransomware="Known"),
+        entry("CVE-2026-0003"),
+    ])
+    assert len(sns.published) == 1
+    alert = sns.published[0]
+    assert alert["Subject"] == "2 new CISA KEV entries (1 used in ransomware)"
+    assert "CVE-2026-0002  Globex Gateway  (due 2026-12-01)  [ransomware]" in alert["Message"]
+    assert "CVE-2026-0003" in alert["Message"]
+
+
+def test_no_alert_when_nothing_is_new(s3, sns, monkeypatch):
+    run_with_feed(monkeypatch, [entry("CVE-2026-0001")])
+    run_with_feed(monkeypatch, [entry("CVE-2026-0001")])
+    assert sns.published == []
+
+
+def test_alert_message_is_capped():
+    entries = [entry(f"CVE-2026-{i:04d}") for i in range(handler.MAX_ENTRIES_IN_ALERT + 7)]
+    subject, message = handler.build_alert(entries)
+    assert subject == f"{len(entries)} new CISA KEV entries"
+    assert "...and 7 more" in message
+    assert len(subject) <= 100
 
 
 def test_unexpected_s3_errors_are_not_swallowed(s3, monkeypatch):

@@ -6,7 +6,8 @@ Triggered by an EventBridge schedule. Each run:
   3. compares CVE IDs against the set seen on previous runs,
   4. writes any newly added entries to S3 as JSON Lines and logs one
      structured line per new entry (easy to query in CloudWatch Logs Insights,
-     or to forward to a monitoring tool such as Datadog).
+     or to forward to a monitoring tool such as Datadog),
+  5. publishes a summary of the new entries to an SNS topic, if one is configured.
 
 The very first run only records a baseline, so ~1,500 existing entries are
 not reported as "new".
@@ -23,25 +24,37 @@ DEFAULT_FEED_URL = (
     "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 )
 STATE_KEY = "state/seen_cve_ids.json"
+# Abort if the feed suddenly has far fewer entries than last time. CISA rarely
+# removes entries, so a big drop means a partial download, not a real change.
+MIN_FEED_RATIO = 0.9
+# Keep alert emails readable and well under SNS's 256 KB message limit.
+MAX_ENTRIES_IN_ALERT = 50
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-_s3_client = None
+_clients = {}
 
 
-def get_s3():
-    """Create the S3 client once per container so warm invocations reuse it.
+def get_client(service):
+    """Create each boto3 client once per container so warm invocations reuse it.
 
     boto3 is imported lazily: the Lambda runtime provides it, and unit tests
     can run without it installed.
     """
-    global _s3_client
-    if _s3_client is None:
+    if service not in _clients:
         import boto3
 
-        _s3_client = boto3.client("s3")
-    return _s3_client
+        _clients[service] = boto3.client(service)
+    return _clients[service]
+
+
+def get_s3():
+    return get_client("s3")
+
+
+def get_sns():
+    return get_client("sns")
 
 
 def log(event_name, **fields):
@@ -76,10 +89,32 @@ def load_seen_ids(s3, bucket):
     return set(json.loads(obj["Body"].read()))
 
 
+def build_alert(new_entries):
+    """Return (subject, message) summarising new KEV entries for SNS."""
+    count = len(new_entries)
+    ransomware = sum(1 for e in new_entries if e.get("knownRansomwareCampaignUse") == "Known")
+    subject = f"{count} new CISA KEV entr{'y' if count == 1 else 'ies'}"
+    if ransomware:
+        subject += f" ({ransomware} used in ransomware)"
+
+    lines = [f"CISA added {count} entr{'y' if count == 1 else 'ies'} to the KEV catalog:", ""]
+    for entry in new_entries[:MAX_ENTRIES_IN_ALERT]:
+        flag = "  [ransomware]" if entry.get("knownRansomwareCampaignUse") == "Known" else ""
+        lines.append(
+            f"{entry['cveID']}  {entry.get('vendorProject', '?')} {entry.get('product', '?')}"
+            f"  (due {entry.get('dueDate', '?')}){flag}"
+        )
+    if count > MAX_ENTRIES_IN_ALERT:
+        lines.append(f"...and {count - MAX_ENTRIES_IN_ALERT} more (see the new/ files in S3).")
+    return subject[:100], "\n".join(lines)  # SNS subjects are limited to 100 characters
+
+
 def lambda_handler(event, context):
     bucket = os.environ["BUCKET_NAME"]
     feed_url = os.environ.get("FEED_URL", DEFAULT_FEED_URL)
-    day_prefix = datetime.now(timezone.utc).strftime("%Y/%m/%d")
+    topic_arn = os.environ.get("TOPIC_ARN")
+    now = datetime.now(timezone.utc)
+    day_prefix = now.strftime("%Y/%m/%d")
     s3 = get_s3()
 
     feed = fetch_feed(feed_url)
@@ -88,6 +123,14 @@ def lambda_handler(event, context):
         # Never overwrite saved state because of a bad or truncated download.
         raise ValueError("feed contained no vulnerabilities; aborting before any writes")
 
+    current_ids = {v["cveID"] for v in vulnerabilities}
+    seen_ids = load_seen_ids(s3, bucket)
+    if seen_ids and len(current_ids) < MIN_FEED_RATIO * len(seen_ids):
+        raise ValueError(
+            f"feed has {len(current_ids)} entries but {len(seen_ids)} were seen before; "
+            "likely a partial download, aborting before any writes"
+        )
+
     s3.put_object(
         Bucket=bucket,
         Key=f"raw/{day_prefix}/kev.json",
@@ -95,8 +138,6 @@ def lambda_handler(event, context):
         ContentType="application/json",
     )
 
-    current_ids = {v["cveID"] for v in vulnerabilities}
-    seen_ids = load_seen_ids(s3, bucket)
     baseline_run = seen_ids is None
     new_entries = [] if baseline_run else [
         v for v in vulnerabilities if v["cveID"] not in seen_ids
@@ -106,7 +147,8 @@ def lambda_handler(event, context):
         body = "".join(json.dumps(entry) + "\n" for entry in new_entries)
         s3.put_object(
             Bucket=bucket,
-            Key=f"new/{day_prefix}/new_entries.jsonl",
+            # Time in the key so a second run on the same day can't overwrite the first.
+            Key=f"new/{day_prefix}/new_entries_{now.strftime('%H%M%S')}.jsonl",
             Body=body.encode("utf-8"),
             ContentType="application/x-ndjson",
         )
@@ -119,6 +161,10 @@ def lambda_handler(event, context):
                 ransomware=entry.get("knownRansomwareCampaignUse"),
                 due_date=entry.get("dueDate"),
             )
+        if topic_arn:
+            subject, message = build_alert(new_entries)
+            get_sns().publish(TopicArn=topic_arn, Subject=subject, Message=message)
+            log("alert_published", new_entries=len(new_entries))
 
     # State is written last. If anything above fails, the next run re-detects
     # the same new entries (at-least-once), instead of silently dropping them.
